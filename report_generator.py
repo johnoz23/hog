@@ -15,6 +15,7 @@ import sys
 import json
 import textwrap
 from datetime import datetime
+from urllib.parse import urlparse
 
 import anthropic
 import openai
@@ -35,6 +36,113 @@ RESEARCH_QUERIES = [
     "What recent news, funding rounds, or product launches has {company} had in the last 12 months?",
     "What are the biggest challenges and opportunities in {company}'s market segment?",
 ]
+
+DATAFORSEO_API_URL = (
+    "https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live"
+)
+
+
+# ---------------------------------------------------------------------------
+# DataForSEO: paid keywords lookup
+# ---------------------------------------------------------------------------
+
+def fetch_paid_keywords(
+    domain: str,
+    login: str,
+    password: str,
+    location_code: int = 2840,
+    language_name: str = "English",
+    limit: int = 1000,
+) -> dict:
+    """Fetch paid (PPC) keywords for *domain* via DataForSEO Labs API.
+
+    Returns a dict with:
+        total_count  – number of paid keywords found
+        keywords     – list of dicts with keyword details
+    """
+    payload = [
+        {
+            "target": domain,
+            "language_name": language_name,
+            "location_code": location_code,
+            "filters": [
+                ["ranked_serp_element.serp_item.type", "=", "paid"]
+            ],
+            "limit": limit,
+        }
+    ]
+
+    resp = requests.post(
+        DATAFORSEO_API_URL,
+        json=payload,
+        auth=(login, password),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Validate top-level status
+    if data.get("status_code") != 20000:
+        raise RuntimeError(
+            f"DataForSEO request failed: {data.get('status_message', 'unknown error')}"
+        )
+
+    task = data["tasks"][0]
+    if task.get("status_code") != 20000:
+        raise RuntimeError(
+            f"DataForSEO task error: {task.get('status_message', 'unknown error')}"
+        )
+
+    result = task.get("result", [{}])[0] if task.get("result") else {}
+    total_count = result.get("total_count", 0)
+    items = result.get("items") or []
+
+    keywords = []
+    for item in items:
+        kw_data = item.get("keyword_data", {})
+        kw_info = kw_data.get("keyword_info", {})
+        serp_elem = item.get("ranked_serp_element", {})
+        serp_item = serp_elem.get("serp_item", {})
+
+        keywords.append({
+            "keyword": kw_data.get("keyword", ""),
+            "search_volume": kw_info.get("search_volume"),
+            "cpc": kw_info.get("cpc"),
+            "competition": kw_info.get("competition"),
+            "position": serp_item.get("rank_group"),
+            "title": serp_item.get("title", ""),
+            "url": serp_item.get("url", ""),
+        })
+
+    return {"total_count": total_count, "keywords": keywords}
+
+
+def print_paid_keywords_report(domain: str, result: dict) -> None:
+    """Pretty-print paid keywords data to the console."""
+    total = result["total_count"]
+    keywords = result["keywords"]
+
+    print(f"\n{'='*60}")
+    print(f"  Paid Keywords Report for: {domain}")
+    print(f"{'='*60}")
+    print(f"\n  Total paid keywords: {total}\n")
+
+    if not keywords:
+        print("  No paid keywords found.")
+        return
+
+    # Header
+    print(f"  {'#':<4} {'Keyword':<40} {'Vol':>8} {'CPC':>8} {'Pos':>5}")
+    print(f"  {'-'*4} {'-'*40} {'-'*8} {'-'*8} {'-'*5}")
+
+    for i, kw in enumerate(keywords, 1):
+        keyword = kw["keyword"][:40]
+        vol = kw["search_volume"] if kw["search_volume"] is not None else "N/A"
+        cpc = f"${kw['cpc']:.2f}" if kw["cpc"] is not None else "N/A"
+        pos = kw["position"] if kw["position"] is not None else "N/A"
+        print(f"  {i:<4} {keyword:<40} {vol:>8} {cpc:>8} {pos:>5}")
+
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +220,8 @@ REPORT_SYSTEM_PROMPT = textwrap.dedent("""\
     4. Competitive Landscape
     5. Recent Developments
     6. Market Opportunities & Challenges
-    7. Key Takeaways (bullet points)
+    7. Paid Search (PPC) Strategy (include only if paid-keyword data is provided)
+    8. Key Takeaways (bullet points)
 
     Use markdown formatting. Be specific — cite numbers, dates, and names
     whenever the research supports it.  Avoid filler and generic statements.
@@ -171,6 +280,12 @@ def main():
         default=None,
         help="Output file path (default: <company>_report.md)",
     )
+    parser.add_argument(
+        "--paid-keywords",
+        action="store_true",
+        default=False,
+        help="Fetch paid (PPC) keywords via DataForSEO and include in the report",
+    )
     args = parser.parse_args()
 
     # Resolve API keys
@@ -182,9 +297,25 @@ def main():
     if not perplexity_key:
         sys.exit("Error: PERPLEXITY_API_KEY environment variable is not set.")
 
+    # DataForSEO credentials (required only when --paid-keywords is used)
+    dataforseo_login = os.environ.get("DATAFORSEO_LOGIN")
+    dataforseo_password = os.environ.get("DATAFORSEO_PASSWORD")
+
+    if args.paid_keywords and (not dataforseo_login or not dataforseo_password):
+        sys.exit(
+            "Error: DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD environment "
+            "variables are required when using --paid-keywords."
+        )
+
     company = args.company
     url = args.url
     output_path = args.output or f"{company.lower().replace(' ', '_')}_report.md"
+
+    # Extract bare domain from URL for DataForSEO queries
+    domain = urlparse(url).netloc or url.replace("https://", "").replace("http://", "").split("/")[0]
+
+    total_steps = 4 if args.paid_keywords else 3
+    step = 0
 
     print(f"\n{'='*60}")
     print(f"  Lead Magnet Report Generator")
@@ -193,15 +324,47 @@ def main():
     print(f"{'='*60}\n")
 
     # Step 1: Scrape metadata
-    print("[1/3] Scraping page metadata...")
+    step += 1
+    print(f"[{step}/{total_steps}] Scraping page metadata...")
     meta = scrape_meta(url)
 
-    # Step 2: Research via Perplexity
-    print("[2/3] Researching company via Perplexity AI...")
+    # Step 2 (optional): Fetch paid keywords via DataForSEO
+    paid_kw_result = None
+    if args.paid_keywords:
+        step += 1
+        print(f"[{step}/{total_steps}] Fetching paid keywords from DataForSEO...")
+        try:
+            paid_kw_result = fetch_paid_keywords(domain, dataforseo_login, dataforseo_password)
+            print_paid_keywords_report(domain, paid_kw_result)
+        except Exception as exc:
+            print(f"  Warning: could not fetch paid keywords: {exc}")
+
+    # Step N-1: Research via Perplexity
+    step += 1
+    print(f"[{step}/{total_steps}] Researching company via Perplexity AI...")
     research = research_company(company, url, perplexity_key)
 
-    # Step 3: Generate report via Claude
-    print("[3/3] Generating report with Claude...")
+    # Append paid keywords as extra research context if available
+    if paid_kw_result and paid_kw_result["keywords"]:
+        kw_summary_lines = [
+            f"Total paid keywords: {paid_kw_result['total_count']}",
+            "",
+            "Top paid keywords:",
+        ]
+        for kw in paid_kw_result["keywords"][:50]:
+            vol = kw["search_volume"] if kw["search_volume"] is not None else "N/A"
+            cpc = f"${kw['cpc']:.2f}" if kw["cpc"] is not None else "N/A"
+            kw_summary_lines.append(
+                f"- {kw['keyword']} (volume: {vol}, CPC: {cpc})"
+            )
+        research.append({
+            "question": f"What paid search (PPC) keywords is {company} bidding on?",
+            "answer": "\n".join(kw_summary_lines),
+        })
+
+    # Step N: Generate report via Claude
+    step += 1
+    print(f"[{step}/{total_steps}] Generating report with Claude...")
     report = generate_report(company, url, research, meta, anthropic_key)
 
     # Write output
